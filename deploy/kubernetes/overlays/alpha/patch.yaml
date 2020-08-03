@@ -1,0 +1,3 @@
+- op: replace
+  path: /spec/template/spec/containers/2/env/3/value
+  value: "true"

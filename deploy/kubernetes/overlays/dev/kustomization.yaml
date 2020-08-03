@@ -5,4 +5,11 @@ bases:
 images:
 - name: amazon/aws-ebs-csi-driver
   newTag: latest
-  newName: chengpan/aws-ebs-csi-driver
+  newName: gajanankulkarni09/aws-ebs-csi-driver
+patchesJson6902:
+- target:
+    group: apps
+    version: v1
+    kind: Deployment
+    name: ebs-csi-controller
+  path: patch.yaml

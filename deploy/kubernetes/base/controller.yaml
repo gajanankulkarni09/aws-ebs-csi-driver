@@ -50,9 +50,17 @@ spec:
                   name: aws-secret
                   key: access_key
                   optional: true
+            - name: AWS_CROSS_ACCOUNT_SUPPORT
+              value: "false"
+          envFrom:
+          - secretRef:
+              name: aws-accounts
+              optional: true
           volumeMounts:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
+            - name: aws-secrets
+              mountPath: /root/.aws
           ports:
             - name: healthz
               containerPort: 9808
@@ -102,3 +110,11 @@ spec:
       volumes:
         - name: socket-dir
           emptyDir: {}
+        - name: aws-secrets
+          secret:
+            secretName: aws-secrets
+            defaultMode: 0400
+        - name: aws-accounts
+          secret:
+            secretName: aws-accounts
+            defaultMode: 0400
