@@ -18,6 +18,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -53,12 +54,23 @@ var (
 		csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
 	}
 )
+var (
+	// ErrInvalidAccounts is an error that is returned when wrong
+	// format of aws-accounts is given in aws-accounts.yaml file
+	ErrInvalidAccounts = errors.New("invalid aws-accounts secret provided")
+
+	errAwsCrenditailNotExist = errors.New("credentials for current account not provided")
+
+	errInvalidIDFormat = errors.New("invalid id format for multiple aws account case")
+)
 
 // controllerService represents the controller service of CSI driver
 type controllerService struct {
-	cloud         cloud.Cloud
-	inFlight      *internal.InFlight
-	driverOptions *DriverOptions
+	cloud         			cloud.Cloud
+	inFlight      			*internal.InFlight
+	driverOptions 			*DriverOptions
+	cloudMap               	map[string]cloud.Cloud
+	multipleAccountSupport 	bool
 }
 
 var (
@@ -68,6 +80,9 @@ var (
 	// NewCloudFunc is a variable for the cloud.NewCloud function that can
 	// be overwritten in unit tests.
 	NewCloudFunc = cloud.NewCloud
+	// NewCloudWithAwsProfileFunc is a variable for the cloud.NewCloudWithAwsProfile function that can
+	// be overwritten in unit tests.
+	NewCloudWithAwsProfileFunc = cloud.NewCloudWithAwsProfile
 )
 
 // newControllerService creates a new controller service
@@ -82,6 +97,35 @@ func newControllerService(driverOptions *DriverOptions) controllerService {
 		region = metadata.GetRegion()
 	}
 
+	multipleAccountsSupport := false
+	var err error
+	if multipleAccountsSupport, err = strconv.ParseBool(os.Getenv("AWS_CROSS_ACCOUNT_SUPPORT")); err != nil {
+		multipleAccountsSupport = false
+	}
+
+	if multipleAccountsSupport {
+		awsProfiles, err := getAwsProfiles()
+		if err != nil {
+			panic(err)
+		}
+
+		cloudMap := make(map[string]cloud.Cloud)
+		for _, awsProfile := range awsProfiles {
+			cloud, err := NewCloudWithAwsProfileFunc(region, awsProfile)
+			if err != nil {
+				panic(err)
+			}
+			cloudMap[awsProfile] = cloud
+		}
+		return controllerService{
+			cloudMap:               cloudMap,
+			driverOptions:          driverOptions,
+			multipleAccountSupport: true,
+		}
+
+	}
+
+	//case if multipleAccountSUpport is not required
 	cloud, err := NewCloudFunc(region)
 	if err != nil {
 		panic(err)
@@ -92,10 +136,12 @@ func newControllerService(driverOptions *DriverOptions) controllerService {
 		inFlight:      internal.NewInFlight(),
 		driverOptions: driverOptions,
 	}
+
 }
 
 func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
 	klog.V(4).Infof("CreateVolume: called with args %+v", *req)
+	klog.V(4).Infof("CreateVolume: called with args (changed gajanan changes) %+v", *req)
 	volName := req.GetName()
 	if len(volName) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume name not provided")
@@ -118,7 +164,19 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		return nil, status.Error(codes.InvalidArgument, errString)
 	}
 
-	disk, err := d.cloud.GetDiskByName(ctx, volName, volSizeBytes)
+	var accountID string
+	if d.multipleAccountSupport {
+		if accountID = pickAccountID(req.GetAccessibilityRequirements()); accountID == "" {
+			return nil, status.Error(codes.InvalidArgument, "AccountID must be provided in topology requirement in request for muliple account case")
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned in secrets file", accountID)
+	}
+
+	disk, err := reqCloud.GetDiskByName(ctx, volName, volSizeBytes)
 	if err != nil {
 		switch err {
 		case cloud.ErrNotFound:
@@ -207,7 +265,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		if disk.SnapshotID != snapshotID {
 			return nil, status.Errorf(codes.AlreadyExists, "Volume already exists, but was restored from a different snapshot than %s", snapshotID)
 		}
-		return newCreateVolumeResponse(disk), nil
+		return newCreateVolumeResponse(disk, accountID), nil
 	}
 
 	// check if a request is already in-flight because the CreateVolume API is not idempotent
@@ -231,6 +289,10 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		volumeTags[k] = v
 	}
 
+	if d.multipleAccountSupport && strings.Contains(snapshotID, accountID) {
+		snapshotID, _, _ = extractIDs(snapshotID)
+	}
+
 	opts := &cloud.DiskOptions{
 		CapacityBytes:    volSizeBytes,
 		Tags:             volumeTags,
@@ -245,7 +307,7 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		SnapshotID:       snapshotID,
 	}
 
-	disk, err = d.cloud.CreateDisk(ctx, volName, opts)
+	disk, err = reqCloud.CreateDisk(ctx, volName, opts)
 	if err != nil {
 		errCode := codes.Internal
 		if err == cloud.ErrNotFound {
@@ -253,7 +315,8 @@ func (d *controllerService) CreateVolume(ctx context.Context, req *csi.CreateVol
 		}
 		return nil, status.Errorf(errCode, "Could not create volume %q: %v", volName, err)
 	}
-	return newCreateVolumeResponse(disk), nil
+
+	return newCreateVolumeResponse(disk, accountID), nil
 }
 
 func (d *controllerService) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
@@ -263,7 +326,20 @@ func (d *controllerService) DeleteVolume(ctx context.Context, req *csi.DeleteVol
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
-	if _, err := d.cloud.DeleteDisk(ctx, volumeID); err != nil {
+	var accountID string
+	var err error
+	if d.multipleAccountSupport {
+		if volumeID, accountID, err = extractIDs(volumeID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "volume id (%s) format is invalid for multiple account case", volumeID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned in secrets file", accountID)
+	}
+
+	if _, err := reqCloud.DeleteDisk(ctx, volumeID); err != nil {
 		if err == cloud.ErrNotFound {
 			klog.V(4).Info("DeleteVolume: volume not found, returning with success")
 			return &csi.DeleteVolumeResponse{}, nil
@@ -279,6 +355,19 @@ func (d *controllerService) ControllerPublishVolume(ctx context.Context, req *cs
 	volumeID := req.GetVolumeId()
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
+	}
+
+	var accountID string
+	var err error
+	if d.multipleAccountSupport {
+		if volumeID, accountID, err = extractIDs(volumeID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "volume id (%s) format is invalid for multiple account case", volumeID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned in secrets file", accountID)
 	}
 
 	nodeID := req.GetNodeId()
@@ -299,10 +388,10 @@ func (d *controllerService) ControllerPublishVolume(ctx context.Context, req *cs
 		return nil, status.Error(codes.InvalidArgument, errString)
 	}
 
-	if !d.cloud.IsExistInstance(ctx, nodeID) {
+	if !reqCloud.IsExistInstance(ctx, nodeID) {
 		return nil, status.Errorf(codes.NotFound, "Instance %q not found", nodeID)
 	}
-	disk, err := d.cloud.GetDiskByID(ctx, volumeID)
+	disk, err := reqCloud.GetDiskByID(ctx, volumeID)
 	if err != nil {
 		if err == cloud.ErrNotFound {
 			return nil, status.Error(codes.NotFound, "Volume not found")
@@ -311,7 +400,7 @@ func (d *controllerService) ControllerPublishVolume(ctx context.Context, req *cs
 	}
 
 	// If given volumeId already assigned to given node, will directly return current device path
-	devicePath, err := d.cloud.AttachDisk(ctx, volumeID, nodeID)
+	devicePath, err := reqCoud.AttachDisk(ctx, volumeID, nodeID)
 	if err != nil {
 		if err == cloud.ErrVolumeInUse {
 			return nil, status.Error(codes.FailedPrecondition, strings.Join(disk.Attachments, ","))
@@ -322,6 +411,9 @@ func (d *controllerService) ControllerPublishVolume(ctx context.Context, req *cs
 	klog.V(5).Infof("ControllerPublishVolume: volume %s attached to node %s through device %s", volumeID, nodeID, devicePath)
 
 	pvInfo := map[string]string{DevicePathKey: devicePath}
+	if d.multipleAccountSupport {
+		pvInfo[AccountIDKey] = accountID
+	}
 	return &csi.ControllerPublishVolumeResponse{PublishContext: pvInfo}, nil
 }
 
@@ -332,12 +424,25 @@ func (d *controllerService) ControllerUnpublishVolume(ctx context.Context, req *
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
+	var accountID string
+	var err error
+	if d.multipleAccountSupport {
+		if volumeID, accountID, err = extractIDs(volumeID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "volume id (%s) format is invalid for multiple account case", volumeID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned in secrets file", accountID)
+	}
+
 	nodeID := req.GetNodeId()
 	if len(nodeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Node ID not provided")
 	}
 
-	if err := d.cloud.DetachDisk(ctx, volumeID, nodeID); err != nil {
+	if err := reqCloud.DetachDisk(ctx, volumeID, nodeID); err != nil {
 		if err == cloud.ErrNotFound {
 			return &csi.ControllerUnpublishVolumeResponse{}, nil
 		}
@@ -381,12 +486,25 @@ func (d *controllerService) ValidateVolumeCapabilities(ctx context.Context, req 
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
+	var accountID string
+	var err error
+	if d.multipleAccountSupport {
+		if volumeID, accountID, err = extractIDs(volumeID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "volume id (%s) format is invalid for multiple account case", volumeID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned in secrets file", accountID)
+	}
+
 	volCaps := req.GetVolumeCapabilities()
 	if len(volCaps) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Volume capabilities not provided")
 	}
 
-	if _, err := d.cloud.GetDiskByID(ctx, volumeID); err != nil {
+	if _, err := reqCloud.GetDiskByID(ctx, volumeID); err != nil {
 		if err == cloud.ErrNotFound {
 			return nil, status.Error(codes.NotFound, "Volume not found")
 		}
@@ -409,6 +527,19 @@ func (d *controllerService) ControllerExpandVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
+	var accountID string
+	var err error
+	if d.multipleAccountSupport {
+		if volumeID, accountID, err = extractIDs(volumeID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "volume id (%s) format is invalid for multiple account case", volumeID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned in secrets file", accountID)
+	}
+
 	capRange := req.GetCapacityRange()
 	if capRange == nil {
 		return nil, status.Error(codes.InvalidArgument, "Capacity range not provided")
@@ -420,7 +551,7 @@ func (d *controllerService) ControllerExpandVolume(ctx context.Context, req *csi
 		return nil, status.Error(codes.InvalidArgument, "After round-up, volume size exceeds the limit specified")
 	}
 
-	actualSizeGiB, err := d.cloud.ResizeDisk(ctx, volumeID, newSize)
+	actualSizeGiB, err := reqCloud.ResizeDisk(ctx, volumeID, newSize)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not resize volume %q: %v", volumeID, err)
 	}
@@ -461,7 +592,21 @@ func (d *controllerService) CreateSnapshot(ctx context.Context, req *csi.CreateS
 	if len(volumeID) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Snapshot volume source ID not provided")
 	}
-	snapshot, err := d.cloud.GetSnapshotByName(ctx, snapshotName)
+
+	var accountID string = ""
+	var err error
+	if d.multipleAccountSupport {
+		if volumeID, accountID, err = extractIDs(volumeID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "volume id (%s) format is invalid for multiple account case", volumeID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not in mentioned secrets file", accountID)
+	}
+
+	snapshot, err := reqCloud.GetSnapshotByName(ctx, snapshotName)
 	if err != nil && err != cloud.ErrNotFound {
 		klog.Errorf("Error looking for the snapshot %s: %v", snapshotName, err)
 		return nil, err
@@ -471,7 +616,7 @@ func (d *controllerService) CreateSnapshot(ctx context.Context, req *csi.CreateS
 			return nil, status.Errorf(codes.AlreadyExists, "Snapshot %s already exists for different volume (%s)", snapshotName, snapshot.SourceVolumeID)
 		}
 		klog.V(4).Infof("Snapshot %s of volume %s already exists; nothing to do", snapshotName, volumeID)
-		return newCreateSnapshotResponse(snapshot)
+		return newCreateSnapshotResponse(snapshot, accountID)
 	}
 
 	snapshotTags := map[string]string{
@@ -489,12 +634,12 @@ func (d *controllerService) CreateSnapshot(ctx context.Context, req *csi.CreateS
 		Tags: snapshotTags,
 	}
 
-	snapshot, err = d.cloud.CreateSnapshot(ctx, volumeID, opts)
-
+	snapshot, err = reqCloud.CreateSnapshot(ctx, volumeID, opts)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not create snapshot %q: %v", snapshotName, err)
 	}
-	return newCreateSnapshotResponse(snapshot)
+	createSnapshotResponse, err := newCreateSnapshotResponse(snapshot, accountID)
+	return createSnapshotResponse, err
 }
 
 func (d *controllerService) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
@@ -504,7 +649,20 @@ func (d *controllerService) DeleteSnapshot(ctx context.Context, req *csi.DeleteS
 		return nil, status.Error(codes.InvalidArgument, "Snapshot ID not provided")
 	}
 
-	if _, err := d.cloud.DeleteSnapshot(ctx, snapshotID); err != nil {
+	var accountID string
+	var err error
+	if d.multipleAccountSupport {
+		if snapshotID, accountID, err = extractIDs(snapshotID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "snapshot id (%s) format is invalid for multiple account case", snapshotID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned in secrets file", accountID)
+	}
+
+	if _, err := reqCloud.DeleteSnapshot(ctx, snapshotID); err != nil {
 		if err == cloud.ErrNotFound {
 			klog.V(4).Info("DeleteSnapshot: snapshot not found, returning with success")
 			return &csi.DeleteSnapshotResponse{}, nil
@@ -520,8 +678,22 @@ func (d *controllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 	var snapshots []*cloud.Snapshot
 
 	snapshotID := req.GetSnapshotId()
+
 	if len(snapshotID) != 0 {
-		snapshot, err := d.cloud.GetSnapshotByID(ctx, snapshotID)
+		accountID := ""
+		var err error
+		if d.multipleAccountSupport {
+			if snapshotID, accountID, err = extractIDs(snapshotID); err == errInvalidIDFormat {
+				return nil, status.Errorf(codes.InvalidArgument, "snapshot id (%s) format is invalid for multiple account case", snapshotID)
+			}
+		}
+
+		var reqCloud cloud.Cloud
+		if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+			return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned secrets file", snapshotID)
+		}
+
+		snapshot, err := reqCloud.GetSnapshotByID(ctx, snapshotID)
 		if err != nil {
 			if err == cloud.ErrNotFound {
 				klog.V(4).Info("ListSnapshots: snapshot not found, returning with success")
@@ -532,7 +704,7 @@ func (d *controllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 		snapshots = append(snapshots, snapshot)
 		if response, err := newListSnapshotsResponse(&cloud.ListSnapshotsResponse{
 			Snapshots: snapshots,
-		}); err != nil {
+		}, accountID); err != nil {
 			return nil, status.Errorf(codes.Internal, "Could not build ListSnapshotsResponse: %v", err)
 		} else {
 			return response, nil
@@ -543,7 +715,20 @@ func (d *controllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 	nextToken := req.GetStartingToken()
 	maxEntries := int64(req.GetMaxEntries())
 
-	cloudSnapshots, err := d.cloud.ListSnapshots(ctx, volumeID, maxEntries, nextToken)
+	var accountID string = ""
+	var err error
+	if d.multipleAccountSupport {
+		if volumeID, accountID, err = extractIDs(volumeID); err == errInvalidIDFormat {
+			return nil, status.Errorf(codes.InvalidArgument, "volume id (%s) format is invalid for multiple account case", volumeID)
+		}
+	}
+
+	var reqCloud cloud.Cloud
+	if reqCloud, err = d.getCloudInstance(accountID); err == errAwsCrenditailNotExist {
+		return nil, status.Errorf(codes.ResourceExhausted, "secret credentials for account id %s not mentioned secrets file", accountID)
+	}
+
+	cloudSnapshots, err := reqCloud.ListSnapshots(ctx, volumeID, maxEntries, nextToken)
 	if err != nil {
 		if err == cloud.ErrNotFound {
 			klog.V(4).Info("ListSnapshots: snapshot not found, returning with success")
@@ -555,11 +740,60 @@ func (d *controllerService) ListSnapshots(ctx context.Context, req *csi.ListSnap
 		return nil, status.Errorf(codes.Internal, "Could not list snapshots: %v", err)
 	}
 
-	response, err := newListSnapshotsResponse(cloudSnapshots)
+	response, err := newListSnapshotsResponse(cloudSnapshots, accountID)
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "Could not build ListSnapshotsResponse: %v", err)
 	}
 	return response, nil
+}
+
+func extractIDs(csiVolumeID string) (volumeID string, accountID string, err error) {
+
+	segments := strings.Split(csiVolumeID, "_")
+	if len(segments) != 2 {
+		return "", "", errInvalidIDFormat
+	}
+
+	accountID = segments[0]
+	volumeID = segments[1]
+
+	return volumeID, accountID, nil
+
+}
+
+func (d *controllerService) getCloudInstance(awsAccountID string) (cloud cloud.Cloud, err error) {
+	if d.multipleAccountSupport {
+		awsProfile := fmt.Sprintf("account_%s", awsAccountID)
+		if tempCloud, ok := d.cloudMap[awsProfile]; ok == true {
+			return tempCloud, nil
+		}
+
+		return nil, errAwsCrenditailNotExist
+	}
+
+	return d.cloud, nil
+}
+
+func getAwsProfiles() ([]string, error) {
+
+	success := true
+	if os.Getenv("ACCOUNTS_COUNT") != "" {
+		if accountsCount, err := strconv.Atoi(os.Getenv("ACCOUNTS_COUNT")); err == nil {
+			awsProfiles := make([]string, accountsCount)
+			for i := 0; i < accountsCount; i++ {
+				if accountID := os.Getenv(fmt.Sprintf("ACCOUNTID_%d", i+1)); accountID != "" {
+					awsProfiles[i] = fmt.Sprintf("account_%s", accountID)
+				} else {
+					success = false
+					break
+				}
+			}
+			if success {
+				return awsProfiles, nil
+			}
+		}
+	}
+	return nil, ErrInvalidAccounts
 }
 
 // pickAvailabilityZone selects 1 zone given topology requirement.
@@ -583,6 +817,7 @@ func pickAvailabilityZone(requirement *csi.TopologyRequirement) string {
 	return ""
 }
 
+
 func getOutpostArn(requirement *csi.TopologyRequirement) string {
 	if requirement == nil {
 		return ""
@@ -603,7 +838,27 @@ func getOutpostArn(requirement *csi.TopologyRequirement) string {
 	return ""
 }
 
-func newCreateVolumeResponse(disk *cloud.Disk) *csi.CreateVolumeResponse {
+func pickAccountID(requirement *csi.TopologyRequirement) string {
+
+	if requirement == nil {
+		return ""
+	}
+	for _, topology := range requirement.GetPreferred() {
+		accountID, exists := topology.GetSegments()[TopologyAccountIDKey]
+		if exists {
+			return accountID
+		}
+	}
+	for _, topology := range requirement.GetRequisite() {
+		accountID, exists := topology.GetSegments()[TopologyAccountIDKey]
+		if exists {
+			return accountID
+		}
+	}
+	return ""
+}
+
+func newCreateVolumeResponse(disk *cloud.Disk, accountID string) *csi.CreateVolumeResponse {
 	var src *csi.VolumeContentSource
 	if disk.SnapshotID != "" {
 		src = &csi.VolumeContentSource{
@@ -626,9 +881,13 @@ func newCreateVolumeResponse(disk *cloud.Disk) *csi.CreateVolumeResponse {
 		segments[AwsOutpostIDKey] = strings.ReplaceAll(arn.Resource, "outpost/", "")
 	}
 
+	if accountID != "" {
+		segments[TopologyAccountIDKey] = accountID
+	}
+
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
-			VolumeId:      disk.VolumeID,
+			VolumeId:      fmt.Sprintf("%s_%s", accountID, disk.VolumeID),
 			CapacityBytes: util.GiBToBytes(disk.CapacityGiB),
 			VolumeContext: map[string]string{},
 			AccessibleTopology: []*csi.Topology{
@@ -639,16 +898,23 @@ func newCreateVolumeResponse(disk *cloud.Disk) *csi.CreateVolumeResponse {
 			ContentSource: src,
 		},
 	}
+
 }
 
-func newCreateSnapshotResponse(snapshot *cloud.Snapshot) (*csi.CreateSnapshotResponse, error) {
+func newCreateSnapshotResponse(snapshot *cloud.Snapshot, accountID string) (*csi.CreateSnapshotResponse, error) {
 	ts, err := ptypes.TimestampProto(snapshot.CreationTime)
 	if err != nil {
 		return nil, err
 	}
+
+	snapshotID := snapshot.SnapshotID
+	if accountID != "" {
+		snapshotID = fmt.Sprintf("%s_%s", accountID, snapshotID)
+	}
+
 	return &csi.CreateSnapshotResponse{
 		Snapshot: &csi.Snapshot{
-			SnapshotId:     snapshot.SnapshotID,
+			SnapshotId:     snapshotID,
 			SourceVolumeId: snapshot.SourceVolumeID,
 			SizeBytes:      snapshot.Size,
 			CreationTime:   ts,
@@ -657,11 +923,11 @@ func newCreateSnapshotResponse(snapshot *cloud.Snapshot) (*csi.CreateSnapshotRes
 	}, nil
 }
 
-func newListSnapshotsResponse(cloudResponse *cloud.ListSnapshotsResponse) (*csi.ListSnapshotsResponse, error) {
+func newListSnapshotsResponse(cloudResponse *cloud.ListSnapshotsResponse, accountID string) (*csi.ListSnapshotsResponse, error) {
 
 	var entries []*csi.ListSnapshotsResponse_Entry
 	for _, snapshot := range cloudResponse.Snapshots {
-		snapshotResponseEntry, err := newListSnapshotsResponseEntry(snapshot)
+		snapshotResponseEntry, err := newListSnapshotsResponseEntry(snapshot, accountID)
 		if err != nil {
 			return nil, err
 		}
@@ -673,14 +939,19 @@ func newListSnapshotsResponse(cloudResponse *cloud.ListSnapshotsResponse) (*csi.
 	}, nil
 }
 
-func newListSnapshotsResponseEntry(snapshot *cloud.Snapshot) (*csi.ListSnapshotsResponse_Entry, error) {
+func newListSnapshotsResponseEntry(snapshot *cloud.Snapshot, accountID string) (*csi.ListSnapshotsResponse_Entry, error) {
 	ts, err := ptypes.TimestampProto(snapshot.CreationTime)
 	if err != nil {
 		return nil, err
 	}
+
+	snapshotID := snapshot.SnapshotID
+	if accountID != "" {
+		snapshotID = fmt.Sprintf("%s_%s", accountID, snapshotID)
+	}
 	return &csi.ListSnapshotsResponse_Entry{
 		Snapshot: &csi.Snapshot{
-			SnapshotId:     snapshot.SnapshotID,
+			SnapshotId:     snapshotID,
 			SourceVolumeId: snapshot.SourceVolumeID,
 			SizeBytes:      snapshot.Size,
 			CreationTime:   ts,

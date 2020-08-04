@@ -21,6 +21,7 @@ const (
 	// devicePathKey represents key for device path in PublishContext
 	// devicePath is the device path where the volume is attached to
 	DevicePathKey = "devicePath"
+	AccountIDKey  = "accountId"
 )
 
 // constants of keys in volume parameters

@@ -47,6 +47,20 @@ func (mr *MockMetadataServiceMockRecorder) GetAvailabilityZone() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAvailabilityZone", reflect.TypeOf((*MockMetadataService)(nil).GetAvailabilityZone))
 }
 
+// GetAccountID mocks base method
+func (m *MockMetadataService) GetAccountID() string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetAccountID")
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// GetAccountID indicates an expected call of GetAccountID
+func (mr *MockMetadataServiceMockRecorder) GetAccountID() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetAccountID", reflect.TypeOf((*MockMetadataService)(nil).GetAccountID))
+}
+
 // GetInstanceID mocks base method
 func (m *MockMetadataService) GetInstanceID() string {
 	m.ctrl.T.Helper()

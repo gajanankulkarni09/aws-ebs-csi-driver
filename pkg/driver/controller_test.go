@@ -60,6 +60,11 @@ func TestNewControllerService(t *testing.T) {
 		}
 	)
 
+	os.Setenv("AWS_CROSS_ACCOUNT_SUPPORT", "true")
+	os.Setenv("ACCOUNTS_COUNT", "2")
+	os.Setenv("ACCOUNTID_1", "991864437682")
+	os.Setenv("ACCOUNTID_2", "626608068914")
+
 	testCases := []struct {
 		name                  string
 		region                string
@@ -133,7 +138,7 @@ func TestNewControllerService(t *testing.T) {
 			}
 
 			controllerSvc := newControllerService(driverOptions)
-
+			os.Unsetenv("AWS_CROSS_ACCOUNT_SUPPORT")
 			if controllerSvc.cloud != cloudObj {
 				t.Fatalf("expected cloud attribute to be equal to instantiated cloud object")
 			}
@@ -180,6 +185,13 @@ func TestCreateVolume(t *testing.T) {
 					CapacityRange:      stdCapRange,
 					VolumeCapabilities: stdVolCap,
 					Parameters:         nil,
+					AccessibilityRequirements: &csi.TopologyRequirement{
+						Preferred: []*csi.Topology{
+							{
+								Segments: map[string]string{TopologyKey: expZone, TopologyAccountIDKey: "626608068914"},
+							},
+						},
+					},
 				}
 
 				ctx := context.Background()
@@ -196,11 +208,17 @@ func TestCreateVolume(t *testing.T) {
 				mockCloud := mocks.NewMockCloud(mockCtl)
 				mockCloud.EXPECT().GetDiskByName(gomock.Eq(ctx), gomock.Eq(req.Name), gomock.Eq(stdVolSize)).Return(nil, cloud.ErrNotFound)
 				mockCloud.EXPECT().CreateDisk(gomock.Eq(ctx), gomock.Eq(req.Name), gomock.Any()).Return(mockDisk, nil)
+				mockcloudMap := make(map[string]cloud.Cloud)
+
+				mockcloudMap["account_991864437682"] = mockCloud
+				mockcloudMap["account_626608068914"] = mockCloud
 
 				awsDriver := controllerService{
 					cloud:         mockCloud,
 					inFlight:      internal.NewInFlight(),
 					driverOptions: &DriverOptions{},
+					cloudMap:               mockcloudMap,
+					multipleAccountSupport: true,
 				}
 
 				if _, err := awsDriver.CreateVolume(ctx, req); err != nil {
@@ -1615,7 +1633,7 @@ func TestDeleteVolume(t *testing.T) {
 			name: "success normal",
 			testFunc: func(t *testing.T) {
 				req := &csi.DeleteVolumeRequest{
-					VolumeId: "vol-test",
+					VolumeId: "626608068914_vol-test",
 				}
 				expResp := &csi.DeleteVolumeResponse{}
 
@@ -1624,11 +1642,18 @@ func TestDeleteVolume(t *testing.T) {
 				defer mockCtl.Finish()
 
 				mockCloud := mocks.NewMockCloud(mockCtl)
-				mockCloud.EXPECT().DeleteDisk(gomock.Eq(ctx), gomock.Eq(req.VolumeId)).Return(true, nil)
+				mockCloud.EXPECT().DeleteDisk(gomock.Eq(ctx), gomock.Eq("vol-test")).Return(true, nil)
+				mockcloudMap := make(map[string]cloud.Cloud)
+
+				mockcloudMap["account_991864437682"] = mockCloud
+				mockcloudMap["account_626608068914"] = mockCloud
+
 				awsDriver := controllerService{
 					cloud:         mockCloud,
 					inFlight:      internal.NewInFlight(),
 					driverOptions: &DriverOptions{},
+					cloudMap:               mockcloudMap,
+					multipleAccountSupport: true,
 				}
 				resp, err := awsDriver.DeleteVolume(ctx, req)
 				if err != nil {
@@ -2532,10 +2557,10 @@ func TestControllerPublishVolume(t *testing.T) {
 				req := &csi.ControllerPublishVolumeRequest{
 					NodeId:           expInstanceID,
 					VolumeCapability: stdVolCap,
-					VolumeId:         "vol-test",
+					VolumeId:         "991864437682_vol-test",
 				}
 				expResp := &csi.ControllerPublishVolumeResponse{
-					PublishContext: map[string]string{DevicePathKey: expDevicePath},
+					PublishContext: map[string]string{DevicePathKey: expDevicePath, AccountIDKey: "991864437682"},
 				}
 
 				ctx := context.Background()
@@ -2548,10 +2573,17 @@ func TestControllerPublishVolume(t *testing.T) {
 				mockCloud.EXPECT().GetDiskByID(gomock.Eq(ctx), gomock.Any()).Return(&cloud.Disk{}, nil)
 				mockCloud.EXPECT().AttachDisk(gomock.Eq(ctx), gomock.Any(), gomock.Eq(req.NodeId)).Return(expDevicePath, nil)
 
+				mockcloudMap := make(map[string]cloud.Cloud)
+
+				mockcloudMap["account_991864437682"] = mockCloud
+				mockcloudMap["account_626608068914"] = mockCloud
+
 				awsDriver := controllerService{
 					cloud:         mockCloud,
 					inFlight:      internal.NewInFlight(),
 					driverOptions: &DriverOptions{},
+					cloudMap:               mockcloudMap,
+					multipleAccountSupport: true,
 				}
 
 				resp, err := awsDriver.ControllerPublishVolume(ctx, req)
@@ -2868,7 +2900,7 @@ func TestControllerUnpublishVolume(t *testing.T) {
 			testFunc: func(t *testing.T) {
 				req := &csi.ControllerUnpublishVolumeRequest{
 					NodeId:   expInstanceID,
-					VolumeId: "vol-test",
+					VolumeId: "991864437682_vol-test",
 				}
 				expResp := &csi.ControllerUnpublishVolumeResponse{}
 
@@ -2878,12 +2910,19 @@ func TestControllerUnpublishVolume(t *testing.T) {
 				defer mockCtl.Finish()
 
 				mockCloud := mocks.NewMockCloud(mockCtl)
-				mockCloud.EXPECT().DetachDisk(gomock.Eq(ctx), req.VolumeId, req.NodeId).Return(nil)
+				mockCloud.EXPECT().DetachDisk(gomock.Eq(ctx), "vol-test", req.NodeId).Return(nil)
+
+				mockcloudMap := make(map[string]cloud.Cloud)
+
+				mockcloudMap["account_991864437682"] = mockCloud
+				mockcloudMap["account_626608068914"] = mockCloud
 
 				awsDriver := controllerService{
 					cloud:         mockCloud,
 					inFlight:      internal.NewInFlight(),
 					driverOptions: &DriverOptions{},
+					cloudMap:               mockcloudMap,
+					multipleAccountSupport: true,
 				}
 
 				resp, err := awsDriver.ControllerUnpublishVolume(ctx, req)

@@ -42,6 +42,7 @@ type MetadataService interface {
 	GetRegion() string
 	GetAvailabilityZone() string
 	GetOutpostArn() arn.ARN
+	GetAccountID() string
 }
 
 type Metadata struct {
@@ -50,6 +51,7 @@ type Metadata struct {
 	Region           string
 	AvailabilityZone string
 	OutpostArn       arn.ARN
+	AccountID        string
 }
 
 // OutpostArnEndpoint is the ec2 instance metadata endpoint to query to get the outpost arn
@@ -80,6 +82,10 @@ func (m *Metadata) GetAvailabilityZone() string {
 // GetOutpostArn returns outpost arn if instance is running on an outpost. empty otherwise.
 func (m *Metadata) GetOutpostArn() arn.ARN {
 	return m.OutpostArn
+}
+// GetAccountID returns the aws AccountID in which the instance is in.
+func (m *Metadata) GetAccountID() string {
+	return m.AccountID
 }
 
 func NewMetadata() (MetadataService, error) {
@@ -128,6 +134,7 @@ func NewMetadataService(svc EC2Metadata) (MetadataService, error) {
 		InstanceType:     doc.InstanceType,
 		Region:           doc.Region,
 		AvailabilityZone: doc.AvailabilityZone,
+		AccountID:        doc.AccountID,
 	}
 
 	outpostArn = strings.ReplaceAll(outpostArn, "outpost/", "")

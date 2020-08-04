@@ -46,6 +46,7 @@ const (
 	AwsAccountIDKey = "topology." + DriverName + "/account-id"
 	AwsRegionKey    = "topology." + DriverName + "/region"
 	AwsOutpostIDKey = "topology." + DriverName + "/outpost-id"
+	TopologyAccountIDKey = "topology." + DriverName + "/accountid"
 )
 
 type Driver struct {

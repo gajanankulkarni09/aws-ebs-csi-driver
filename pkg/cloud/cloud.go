@@ -99,6 +99,8 @@ const (
 	KubernetesTagKeyPrefix = "kubernetes.io"
 	// AWSTagKeyPrefix is the prefix of the key value that is reserved for AWS.
 	AWSTagKeyPrefix = "aws:"
+	//Nil profile value
+	nilProfile = ""
 )
 
 var (
@@ -228,10 +230,16 @@ var _ Cloud = &cloud{}
 // NewCloud returns a new instance of AWS cloud
 // It panics if session is invalid
 func NewCloud(region string) (Cloud, error) {
-	return newEC2Cloud(region)
+	return newEC2Cloud(region, nilProfile)
 }
 
-func newEC2Cloud(region string) (Cloud, error) {
+func NewCloudWithAwsProfile(region string, awsProfile string) (Cloud, error) {
+	return newEC2Cloud(region, awsProfile)
+}
+
+func newEC2Cloud(region string, awsProfile string) (Cloud, error) {
+	var tempSession *session.Session
+	var err error
 	awsConfig := &aws.Config{
 		Region:                        aws.String(region),
 		CredentialsChainVerboseErrors: aws.Bool(true),
@@ -244,10 +252,23 @@ func newEC2Cloud(region string) (Cloud, error) {
 		awsConfig.Endpoint = aws.String(endpoint)
 	}
 
+	if awsProfile == nilProfile {
+		tempSession = session.Must(session.NewSession(awsConfig))
+	} else {
+		tempSession, err = session.NewSessionWithOptions(session.Options{
+			Profile: awsProfile,
+			Config: aws.Config{
+				Region: aws.String(region),
+			},
+		})
+		if err != nil {
+			panic(err)
+		}
+	}
 	return &cloud{
 		region: region,
 		dm:     dm.NewDeviceManager(),
-		ec2:    ec2.New(session.Must(session.NewSession(awsConfig))),
+		ec2:    ec2.New(tempSession),
 	}, nil
 }
 
