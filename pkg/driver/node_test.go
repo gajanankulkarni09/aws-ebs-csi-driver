@@ -1247,6 +1247,7 @@ func TestNodeGetInfo(t *testing.T) {
 		instanceID        string
 		instanceType      string
 		availabilityZone  string
+		accountID         string
 		volumeAttachLimit int64
 		expMaxVolumes     int64
 	}{
@@ -1255,6 +1256,7 @@ func TestNodeGetInfo(t *testing.T) {
 			instanceID:        "i-123456789abcdef01",
 			instanceType:      "t2.medium",
 			availabilityZone:  "us-west-2b",
+			accountID:         "123423695262",
 			volumeAttachLimit: -1,
 			expMaxVolumes:     39,
 		},
@@ -1263,6 +1265,7 @@ func TestNodeGetInfo(t *testing.T) {
 			instanceID:        "i-123456789abcdef01",
 			instanceType:      "t2.medium",
 			availabilityZone:  "us-west-2b",
+			accountID:         "123423695262",
 			volumeAttachLimit: 42,
 			expMaxVolumes:     42,
 		},
@@ -1271,6 +1274,7 @@ func TestNodeGetInfo(t *testing.T) {
 			instanceID:        "i-123456789abcdef01",
 			instanceType:      "m5d.large",
 			availabilityZone:  "us-west-2b",
+			accountID:         "123423695262",
 			volumeAttachLimit: -1,
 			expMaxVolumes:     25,
 		},
@@ -1279,6 +1283,7 @@ func TestNodeGetInfo(t *testing.T) {
 			instanceID:        "i-123456789abcdef01",
 			instanceType:      "m5d.large",
 			availabilityZone:  "us-west-2b",
+			accountID:         "123423695262",
 			volumeAttachLimit: 30,
 			expMaxVolumes:     30,
 		},
@@ -1297,6 +1302,7 @@ func TestNodeGetInfo(t *testing.T) {
 			mockMetadata := mocks.NewMockMetadataService(mockCtl)
 			mockMetadata.EXPECT().GetInstanceID().Return(tc.instanceID)
 			mockMetadata.EXPECT().GetAvailabilityZone().Return(tc.availabilityZone)
+			mockMetadata.EXPECT().GetAccountID().Return(tc.accountID)
 
 			if tc.volumeAttachLimit < 0 {
 				mockMetadata.EXPECT().GetInstanceType().Return(tc.instanceType)

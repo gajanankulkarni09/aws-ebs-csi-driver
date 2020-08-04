@@ -100,6 +100,12 @@ func (d *nodeService) NodeStageVolume(ctx context.Context, req *csi.NodeStageVol
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
+	accountID, accountIDExists := req.PublishContext[AccountIDKey]
+	if accountIDExists {
+		runes := []rune(volumeID)
+		volumeID = string(runes[len(accountID)+1 : len(volumeID)])
+	}
+
 	target := req.GetStagingTargetPath()
 	if len(target) == 0 {
 		return nil, status.Error(codes.InvalidArgument, "Staging target not provided")
@@ -367,7 +373,9 @@ func (d *nodeService) NodeGetInfo(ctx context.Context, req *csi.NodeGetInfoReque
 	klog.V(4).Infof("NodeGetInfo: called with args %+v", *req)
 
 	topology := &csi.Topology{
-		Segments: map[string]string{TopologyKey: d.metadata.GetAvailabilityZone()},
+		Segments: map[string]string{TopologyKey: d.metadata.GetAvailabilityZone(),
+			TopologyAccountIDKey: d.metadata.GetAccountID(),
+		},
 	}
 
 	return &csi.NodeGetInfoResponse{
@@ -385,6 +393,13 @@ func (d *nodeService) nodePublishVolumeForBlock(req *csi.NodePublishVolumeReques
 	if !exists {
 		return status.Error(codes.InvalidArgument, "Device path not provided")
 	}
+
+	accountID, exists := req.PublishContext[AccountIDKey]
+	if exists {
+		runes := []rune(volumeID)
+		volumeID = string(runes[len(accountID)+1 : len(volumeID)])
+	}
+
 	source, err := d.findDevicePath(devicePath, volumeID)
 	if err != nil {
 		return status.Errorf(codes.Internal, "Failed to find device path %s. %v", devicePath, err)

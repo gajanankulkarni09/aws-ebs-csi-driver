@@ -40,8 +40,9 @@ const (
 )
 
 const (
-	DriverName  = "ebs.csi.aws.com"
-	TopologyKey = "topology." + DriverName + "/zone"
+	DriverName           = "ebs.csi.aws.com"
+	TopologyKey          = "topology." + DriverName + "/zone"
+	TopologyAccountIDKey = "topology." + DriverName + "/accountid"
 )
 
 type Driver struct {

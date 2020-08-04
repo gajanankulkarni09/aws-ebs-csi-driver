@@ -35,6 +35,7 @@ type MetadataService interface {
 	GetInstanceType() string
 	GetRegion() string
 	GetAvailabilityZone() string
+	GetAccountID() string
 }
 
 type Metadata struct {
@@ -42,6 +43,7 @@ type Metadata struct {
 	InstanceType     string
 	Region           string
 	AvailabilityZone string
+	AccountID        string
 }
 
 var _ MetadataService = &Metadata{}
@@ -64,6 +66,11 @@ func (m *Metadata) GetRegion() string {
 // GetAvailabilityZone returns the Availability Zone which the instance is in.
 func (m *Metadata) GetAvailabilityZone() string {
 	return m.AvailabilityZone
+}
+
+// GetAccountID returns the aws AccountID in which the instance is in.
+func (m *Metadata) GetAccountID() string {
+	return m.AccountID
 }
 
 func NewMetadata() (MetadataService, error) {
@@ -104,5 +111,6 @@ func NewMetadataService(svc EC2Metadata) (MetadataService, error) {
 		InstanceType:     doc.InstanceType,
 		Region:           doc.Region,
 		AvailabilityZone: doc.AvailabilityZone,
+		AccountID:        doc.AccountID,
 	}, nil
 }
